@@ -11,7 +11,7 @@ async def fast_upload_file(
     client: TelegramClient,
     file_path: str,
     progress_callback: callable = None,
-    concurrency: int = 6,
+    concurrency: int = 8,
 ) -> TypeInputFile:
     """
     High-speed pipelined parallel multipart upload for Telegram MTProto.

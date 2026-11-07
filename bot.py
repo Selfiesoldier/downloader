@@ -121,8 +121,13 @@ def get_ydl_opts(extra_opts: dict = None) -> dict:
         "ignoreerrors": False,
         "no_color": True,
         "geo_bypass": True,
-        "socket_timeout": 30,
-        "retries": 3,
+        "socket_timeout": 20,
+        "retries": 5,
+        "fragment_retries": 5,
+        # Multi-threaded parallel turbo downloading (8 streams)
+        "concurrent_fragment_downloads": 8,
+        "buffersize": 1024 * 1024,
+        "http_chunk_size": 10485760,
     }
     if FFMPEG_PATH:
         opts["ffmpeg_location"] = FFMPEG_PATH
@@ -509,15 +514,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=constants.ParseMode.MARKDOWN
                 )
 
-                last_progress_edit = [0]
+                upload_stats = {"current": 0, "total": file_size}
+                upload_done = asyncio.Event()
 
-                async def upload_progress(current, total):
-                    now = time.time()
-                    if now - last_progress_edit[0] >= 2.5:
-                        last_progress_edit[0] = now
-                        pct = int((current / total) * 100) if total else 0
-                        cur_mb = current / (1024 * 1024)
-                        tot_mb = total / (1024 * 1024)
+                def sync_progress(cur, tot):
+                    upload_stats["current"] = cur
+                    upload_stats["total"] = tot
+
+                async def progress_notifier():
+                    while not upload_done.is_set():
+                        await asyncio.sleep(2.5)
+                        if upload_done.is_set():
+                            break
+                        cur = upload_stats["current"]
+                        tot = upload_stats["total"]
+                        pct = int((cur / tot) * 100) if tot else 0
+                        cur_mb = cur / (1024 * 1024)
+                        tot_mb = tot / (1024 * 1024)
                         bar = '█' * (pct // 10) + '░' * (10 - pct // 10)
                         try:
                             await query.edit_message_text(
@@ -528,13 +541,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             pass
 
-                # Upload with 512KB chunks and 6-way concurrency
-                input_file = await fast_upload_file(
-                    telethon_client,
-                    file_path,
-                    progress_callback=upload_progress,
-                    concurrency=6
-                )
+                notifier_task = asyncio.create_task(progress_notifier())
+
+                try:
+                    # Turbo upload: 512KB chunks with 8 concurrent upload pipes
+                    input_file = await fast_upload_file(
+                        telethon_client,
+                        file_path,
+                        progress_callback=sync_progress,
+                        concurrency=8
+                    )
+                finally:
+                    upload_done.set()
+                    notifier_task.cancel()
 
                 if mode == "audio" or file_path.endswith(".mp3"):
                     attributes = [DocumentAttributeAudio(duration=int(duration or 0), title=title[:60], performer=author[:40])]
