@@ -385,7 +385,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "title": title,
         "author": author,
         "duration": duration,
-        "platform": platform
+        "platform": platform,
+        "width": info.get("width"),
+        "height": info.get("height"),
     }
 
     if len(MEDIA_CACHE) > 100:
@@ -544,7 +546,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         attributes=attributes,
                     )
                 else:
-                    attributes = [DocumentAttributeVideo(duration=int(duration or 0), supports_streaming=True)]
+                    vid_w = media_data.get("width")
+                    vid_h = media_data.get("height")
+                    if mode.isdigit():
+                        target_h = int(mode)
+                        if vid_h and vid_w:
+                            vid_w = int(target_h * (vid_w / vid_h))
+                            vid_h = target_h
+                        else:
+                            vid_h = target_h
+                            vid_w = int(target_h * 16 / 9)
+                    vid_w = int(vid_w or 1280)
+                    vid_h = int(vid_h or 720)
+
+                    attributes = [
+                        DocumentAttributeVideo(
+                            duration=int(duration or 0),
+                            w=vid_w,
+                            h=vid_h,
+                            supports_streaming=True
+                        )
+                    ]
                     await telethon_client.send_file(
                         chat_id,
                         input_file,
