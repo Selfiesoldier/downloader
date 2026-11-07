@@ -1,0 +1,20 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local binary & downloads
+bin/
+downloads/
+*.mp4
+*.mp3
+*.part
+*.tmp
+
+# Telethon MTProto sessions
+*.session
+*.session-journal
+
+# Secrets
+.env
