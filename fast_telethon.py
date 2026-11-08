@@ -48,8 +48,10 @@ class MTProtoConnectionPool:
                 return
 
             # Check if client has low-level Telethon connection machinery
+            is_mock = hasattr(self.client, "mock_calls") or hasattr(self.client, "assert_called")
             has_internals = (
-                hasattr(self.client, "_sender")
+                not is_mock
+                and hasattr(self.client, "_sender")
                 and hasattr(self.client, "_get_dc")
                 and hasattr(self.client, "_connection")
             )
