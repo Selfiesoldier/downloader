@@ -30,3 +30,4 @@ A resilient, high-speed Universal Media Downloader Telegram Bot capable of downl
 - [ ] Concurrency limits and queue supervisor prevent disk exhaustion and process crashes on Termux.
 - [ ] Active in-flight downloads can be cancelled cleanly by users.
 - [ ] Multi-part carousels and playlists deliver sequentially without race conditions.
+

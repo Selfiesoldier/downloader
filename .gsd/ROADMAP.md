@@ -18,14 +18,16 @@
 
 ## Phases
 
-### Phase 1: Download Queueing, Concurrency Limits & Termux Disk Safety
-**Status:** 🟡 In Discussion  
-**Objective:** Protect low-memory and low-storage mobile environments (Termux) by enforcing a bounded concurrent download semaphore, FIFO job queue with live position notifications, interactive cancellation, and robust temp directory lifecycle cleanup.  
+### Phase 1: Download Queueing, Concurrency Limits & Cookieless Extraction
+**Status:** 🟡 Ready for Planning  
+**Objective:** Eliminate user cookie requirements by utilizing modern client emulation and resolver fallbacks, while protecting Android Termux resources via a strict single-worker FIFO download queue, user cancellation, and automated temporary disk space cleanup.  
 **Deliverables:**
-- Async download task queue manager with configurable max concurrency (e.g. 1-2 concurrent tasks).
+- Cookieless YouTube extraction using `visionos` and `android_vr` client rotation.
+- Automated cookieless fallback resolver for Instagram (embed CDN / Cobalt resolver) and Twitter (`api.fxtwitter.com`).
+- Async download task queue manager with single-worker concurrency (`asyncio.Queue` / semaphore).
 - Interactive "Cancel Download" inline button terminating active `yt-dlp` processes.
 - Startup and post-download garbage collection for orphaned `dl_*` temp directories and stale `.part` files.
-- Disk headroom check (aborts if free space < target file size).
+- Disk headroom check (aborts if free space < target file size or < 500 MB).
 
 ### Phase 2: Media Metadata, Thumbnails & Audio Tagging
 **Status:** ⬜ Not Started  
@@ -50,3 +52,4 @@
 - Fast FFmpeg stream-copy chunk splitter for media files exceeding 2,000 MB.
 - Cookie expiration pro-active notification.
 - Automated watchdog and process recovery.
+
