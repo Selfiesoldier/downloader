@@ -28,6 +28,12 @@ from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
 from fast_telethon import fast_upload_file
 
 import yt_dlp
+from extractors import (
+    CookielessExtractorEngine,
+    get_cookieless_ydl_opts,
+    extract_smart_formats,
+    extract_media_info,
+)
 
 # --- LOGGING CONFIGURATION ---
 logging.basicConfig(
@@ -198,212 +204,87 @@ def format_size_str(bytes_val: int) -> str:
 
 
 def get_ydl_opts(extra_opts: dict = None, url: str = None) -> dict:
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": False,
-        "no_color": True,
-        "geo_bypass": True,
-        "socket_timeout": 20,
-        "retries": 5,
-        "fragment_retries": 5,
-        # Multi-threaded parallel turbo downloading (8 streams)
-        "concurrent_fragment_downloads": 8,
-        "buffersize": 1024 * 1024,
-        "http_chunk_size": 10485760,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-    }
-    if FFMPEG_PATH:
-        opts["ffmpeg_location"] = FFMPEG_PATH
-
+    """Cookieless ydl options wrapper with optional admin cookie injection."""
+    opts = get_cookieless_ydl_opts(url=url, extra_opts=extra_opts)
     cookie_path = resolve_cookies(url)
     if cookie_path:
         opts["cookiefile"] = cookie_path
-        # Authenticated: web and mobile formats both work cleanly
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["web", "android", "mweb"],
-                "player_skip": ["js", "configs", "webpage"]
-            }
-        }
-        logger.info(f"Loaded active cookie session: {Path(cookie_path).name}")
-    else:
-        # Anonymous without cookies: use mobile android/ios to minimize web bot challenges
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android", "ios"],
-                "player_skip": ["js", "configs", "webpage"]
-            }
-        }
-
-    if extra_opts:
-        opts.update(extra_opts)
+        logger.info(f"Admin cookie active: {Path(cookie_path).name}")
     return opts
 
 
 async def fetch_media_info(url: str) -> dict:
-    """Fast, optimized metadata extraction without redundant HTTP format checks."""
+    """Cookieless metadata extraction with platform resolver cascades and client rotation."""
     loop = asyncio.get_running_loop()
 
     def _extract():
-        opts = get_ydl_opts({
+        cookie_path = resolve_cookies(url)
+        extra = {
             "extract_flat": False,
             "skip_download": True,
             "no_playlist": True,
             "check_formats": False,
             "youtube_include_dash_manifest": True,
             "youtube_include_hls_manifest": False,
-        }, url=url)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
+        }
+        if cookie_path:
+            extra["cookiefile"] = cookie_path
+        return CookielessExtractorEngine.extract_info(url, extra_opts=extra)
 
     return await loop.run_in_executor(None, _extract)
 
 
 def extract_available_formats(info: dict) -> tuple[list[dict], str]:
-    """
-    Extracts available resolutions (1080p, 720p, 480p, 360p, etc.)
-    and estimates accurate file sizes for both landscape and vertical videos.
-    """
-    formats = info.get("formats", [])
-    duration = info.get("duration") or 0
-
-    # Determine audio size
-    best_audio_size = 0
-    for f in formats:
-        if f.get("vcodec") == "none" and f.get("acodec") != "none":
-            sz = f.get("filesize") or f.get("filesize_approx")
-            if not sz and f.get("tbr") and duration:
-                sz = int((f["tbr"] * 1000 / 8) * duration)
-            if sz and sz > best_audio_size:
-                best_audio_size = sz
-    if not best_audio_size and duration:
-        best_audio_size = int((192 * 1000 / 8) * duration)
-
-    # Standard bitrate fallback estimates in bytes per second
-    bitrate_estimates = {
-        2160: int(18.0 * 1024 * 1024 / 8),
-        1440: int(8.0 * 1024 * 1024 / 8),
-        1080: int(3.5 * 1024 * 1024 / 8),
-        720:  int(1.8 * 1024 * 1024 / 8),
-        480:  int(0.8 * 1024 * 1024 / 8),
-        360:  int(0.4 * 1024 * 1024 / 8),
-    }
-
-    # Map effective height for both landscape and portrait/vertical (Shorts/Reels)
-    available_eff_heights = {}
-    for f in formats:
-        h = f.get("height")
-        w = f.get("width")
-        if (h or w) and f.get("vcodec") != "none":
-            eff = min(h, w) if (h and w) else (h or w)
-            sz = f.get("filesize") or f.get("filesize_approx")
-            tbr = f.get("tbr") or f.get("vbr")
-            if not sz and tbr and duration:
-                sz = int((tbr * 1000 / 8) * duration)
-            if eff not in available_eff_heights or (sz and sz > available_eff_heights[eff]):
-                available_eff_heights[eff] = sz or 0
-
-    brackets = [
-        (2160, "🌟 4K (2160p)"),
-        (1440, "💎 2K (1440p)"),
-        (1080, "🎬 1080p FHD"),
-        (720,  "📺 720p HD"),
-        (480,  "📱 480p SD"),
-        (360,  "💾 360p Low"),
-    ]
-
-    resolutions = []
-    if available_eff_heights:
-        max_source_height = max(available_eff_heights.keys())
-        for target, label in brackets:
-            # Include bracket if source supports it or is within reasonable range
-            if target <= max_source_height + 60:
-                matching_sizes = [
-                    sz for eff, sz in available_eff_heights.items()
-                    if abs(eff - target) <= 60 and sz > 0
-                ]
-                if matching_sizes:
-                    sz = max(matching_sizes)
-                    if best_audio_size:
-                        sz += best_audio_size
-                elif duration > 0:
-                    sz = bitrate_estimates.get(target, int(1.0 * 1024 * 1024 / 8)) * duration
-                else:
-                    sz = 0
-
-                size_str = format_size_str(sz)
-                resolutions.append({
-                    "height": target,
-                    "label": f"{label}{size_str}"
-                })
-    else:
-        # Fallback for single-stream sites (Instagram, TikTok, Twitter, web links)
-        for target, label in [
-            (1080, "🎬 Best HD (1080p)"),
-            (720,  "📺 Standard (720p)"),
-            (480,  "📱 Data Saver (480p)"),
-        ]:
-            sz = bitrate_estimates.get(target, int(1.0 * 1024 * 1024 / 8)) * duration if duration else 0
-            size_str = format_size_str(sz)
-            resolutions.append({
-                "height": target,
-                "label": f"{label}{size_str}"
-            })
-
-    audio_size_str = format_size_str(best_audio_size)
-    return resolutions, audio_size_str
+    """Compatibility wrapper around extract_smart_formats."""
+    return extract_smart_formats(info)
 
 
-def download_media_sync(url: str, mode: str, temp_dir: str) -> tuple[list[str], str | None]:
+def download_media_sync(url: str, mode: str, temp_dir: str, direct_url: str | None = None) -> tuple[list[str], str | None]:
     """
     Downloads media to isolated temp_dir synchronously.
-    Handles single videos, audio, movies, and multi-video carousels cleanly.
+    Handles single videos, audio, movies, and multi-video carousels cleanly,
+    with automatic fallback to direct stream URL if native extraction meets login walls.
     """
     out_tmpl = os.path.join(temp_dir, "%(title).50s [%(id)s].%(ext)s")
 
-    if mode == "audio":
-        opts = get_ydl_opts({
-            "format": "bestaudio/best",
-            "outtmpl": out_tmpl,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        }, url=url)
-    elif mode.isdigit():
-        height = int(mode)
-        # Match both height and width so vertical shorts/reels (e.g. 1080x1920) work perfectly
-        opts = get_ydl_opts({
-            "format": (
-                f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[width<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={height}]+bestaudio/"
-                f"bestvideo[width<={height}]+bestaudio/"
-                f"best[height<={height}]/"
-                f"best[width<={height}]/"
-                f"best"
-            ),
-            "outtmpl": out_tmpl,
-            "merge_output_format": "mp4",
-        }, url=url)
-    else:  # video_best
-        opts = get_ydl_opts({
-            "format": "bestvideo+bestaudio/best",
-            "outtmpl": out_tmpl,
-            "merge_output_format": "mp4",
-        }, url=url)
+    def _build_opts(target_url: str) -> dict:
+        if mode == "audio":
+            return get_ydl_opts({
+                "format": "bestaudio/best",
+                "outtmpl": out_tmpl,
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+            }, url=target_url)
+        elif mode.isdigit():
+            height = int(mode)
+            # Match both height and width so vertical shorts/reels (e.g. 1080x1920) work perfectly
+            return get_ydl_opts({
+                "format": (
+                    f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                    f"bestvideo[width<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<={height}]+bestaudio/"
+                    f"bestvideo[width<={height}]+bestaudio/"
+                    f"best[height<={height}]/"
+                    f"best[width<={height}]/"
+                    f"best"
+                ),
+                "outtmpl": out_tmpl,
+                "merge_output_format": "mp4",
+            }, url=target_url)
+        else:  # video_best
+            return get_ydl_opts({
+                "format": "bestvideo+bestaudio/best",
+                "outtmpl": out_tmpl,
+                "merge_output_format": "mp4",
+            }, url=target_url)
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
+    valid_exts = {".mp4", ".m4a", ".webm", ".mp3", ".mkv", ".mov"}
 
-        valid_exts = {".mp4", ".m4a", ".webm", ".mp3", ".mkv", ".mov"}
-        found_files = []
+    def _find_files() -> list[str]:
+        found = []
         for root, _, files in os.walk(temp_dir):
             for f in sorted(files):
                 if not f.endswith((".part", ".ytdl", ".temp")):
@@ -411,13 +292,32 @@ def download_media_sync(url: str, mode: str, temp_dir: str) -> tuple[list[str], 
                     if ext in valid_exts:
                         full_path = os.path.join(root, f)
                         if os.path.getsize(full_path) > 1000:
-                            found_files.append(full_path)
+                            found.append(full_path)
+        return found
 
-        if found_files:
-            return found_files, None
-        return [], "No downloaded media files found in output directory"
+    opts = _build_opts(url)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+        files = _find_files()
+        if files:
+            return files, None
     except Exception as e:
+        logger.warning(f"Download with primary URL failed ({e}). Checking direct fallback URL...")
+        if direct_url and direct_url != url:
+            try:
+                fallback_opts = _build_opts(direct_url)
+                with yt_dlp.YoutubeDL(fallback_opts) as fallback_ydl:
+                    fallback_ydl.extract_info(direct_url, download=True)
+                files = _find_files()
+                if files:
+                    return files, None
+            except Exception as fb_err:
+                logger.error(f"Fallback download also failed: {fb_err}")
+                return [], str(fb_err)
         return [], str(e)
+
+    return [], "No downloaded media files found in output directory"
 
 
 # --- TELEGRAM HANDLERS ---
@@ -438,7 +338,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🤖 **Reddit** (Clips with sound)\n"
         "• 📘 **Facebook** (Reels & Videos)\n"
         "• ☁️ **SoundCloud** (High quality MP3)\n\n"
-        "🍪 Use /cookies to check or upload authenticated session cookies.\n"
+        "✨ **Instant Cookieless Downloads:** No login or cookie setup required.\n"
         "👉 **Just paste your link below to download!**"
     )
     await update.message.reply_text(welcome_text, parse_mode=constants.ParseMode.MARKDOWN)
@@ -452,8 +352,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Choose your preferred quality (4K, 1080p, 720p, 480p, 360p, or MP3).\n"
         "4. The bot will download and deliver it directly to you!\n\n"
         "🚀 **2 GB File Limit:** Supports files up to **2,000 MB (2 GB)** with parallel MTProto upload speed!\n\n"
-        "🍪 **Bypassing Bot/Login Checks:**\n"
-        "If YouTube asks for bot confirmation or Instagram requires login, send your `cookies.txt` directly to this chat or use /cookies."
+        "⚡ **Zero Cookies Required:** Instant cookieless downloads powered by smart player client rotation and automatic resolver fallbacks."
     )
     await update.message.reply_text(help_text, parse_mode=constants.ParseMode.MARKDOWN)
 
@@ -579,17 +478,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         err_lower = err_str.lower()
         if "confirm you're not a bot" in err_lower or "sign in to confirm" in err_lower:
             error_guidance = (
-                "❌ **YouTube Anti-Bot Check Triggered!**\n\n"
-                "YouTube is requesting bot verification for this video/IP.\n\n"
-                "💡 **Solution:** Send your `youtube_cookies.txt` or `cookies.txt` file directly into this chat.\n"
-                "Type /cookies for instructions."
+                "❌ **Download Unavailable**\n\n"
+                "The media host has temporarily restricted direct stream access for this item.\n"
+                "Please try again in a few moments or choose a different link."
             )
         elif "login required" in err_lower or "checkpoint_required" in err_lower or "rate-limit" in err_lower:
             error_guidance = (
-                "❌ **Instagram Login Required!**\n\n"
-                "Instagram requires an active logged-in session to access this reel/post.\n\n"
-                "💡 **Solution:** Send your `instagram_cookies.txt` directly into this chat.\n"
-                "Type /cookies for instructions."
+                "❌ **Post Is Private or Restricted**\n\n"
+                "This post cannot be accessed without special permissions or is private.\n"
+                "Please ensure the link is public and still available."
             )
         else:
             error_guidance = (
@@ -613,6 +510,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cache_key = f"{user_id}_{abs(hash(url))}"
     MEDIA_CACHE[cache_key] = {
         "url": url,
+        "direct_url": info.get("url"),
         "title": title,
         "author": author,
         "duration": duration,
@@ -697,7 +595,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
 
     try:
-        file_paths, err = await loop.run_in_executor(None, download_media_sync, url, mode, temp_dir)
+        direct_url = media_data.get("direct_url")
+        file_paths, err = await loop.run_in_executor(None, download_media_sync, url, mode, temp_dir, direct_url)
 
         if err or not file_paths:
             logger.error(f"Download failed for {url}: {err}")
