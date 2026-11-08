@@ -6,6 +6,9 @@ Provides:
 - reassemble_chunks: Zero-loss sequential reassembly and validation of indexed chunk parts.
 - calculate_byte_ranges: Slices file size into non-overlapping byte ranges.
 - ChunkIntegrityError: Explicit exception raised when chunk or reassembly validation fails.
+- detect_aria2c: Cross-platform aria2c binary locator (Termux, PATH, local bin).
+- get_turbo_downloader_opts: High-performance fragment & socket acceleration options for yt-dlp.
+- download_media_turbo: Unified entry point for turbo-accelerated media retrieval.
 """
 
 import asyncio
@@ -408,3 +411,114 @@ class SegmentedChunkDownloader:
             finally:
                 if chunks_dir.exists():
                     shutil.rmtree(chunks_dir, ignore_errors=True)
+
+
+def detect_aria2c() -> Optional[str]:
+    """
+    Checks Termux binary path (/data/data/com.termux/files/usr/bin/aria2c).
+    Checks system PATH via shutil.which("aria2c").
+    Checks local bin directory (bin/aria2c or bin/aria2c.exe).
+    Returns verified executable path or None.
+    """
+    termux_aria2c = "/data/data/com.termux/files/usr/bin/aria2c"
+    if os.path.exists(termux_aria2c) and os.access(termux_aria2c, os.X_OK):
+        return termux_aria2c
+
+    which_aria2c = shutil.which("aria2c")
+    if which_aria2c:
+        return which_aria2c
+
+    base_dir = Path(__file__).resolve().parent
+    local_bin = base_dir / "bin" / ("aria2c.exe" if os.name == "nt" else "aria2c")
+    if local_bin.exists() and (os.name == "nt" or os.access(local_bin, os.X_OK)):
+        return str(local_bin)
+
+    return None
+
+
+def get_turbo_downloader_opts(base_opts: Optional[dict] = None, concurrency: int = 8) -> dict:
+    """
+    Configures turbo downloader options for yt-dlp:
+    - 8 concurrent fragment downloads
+    - 1MB buffersize, 10MB http_chunk_size
+    - 5 retries and fragment retries
+    - aria2c external downloader with --file-allocation=none if detected
+    """
+    opts = dict(base_opts) if base_opts else {}
+
+    opts["concurrent_fragment_downloads"] = concurrency
+    opts["buffersize"] = 1048576       # 1MB
+    opts["http_chunk_size"] = 10485760 # 10MB
+    opts["retries"] = 5
+    opts["fragment_retries"] = 5
+
+    aria2c_path = detect_aria2c()
+    if aria2c_path:
+        opts["external_downloader"] = {"default": aria2c_path}
+        opts["external_downloader_args"] = {
+            "aria2c": [
+                "-s", str(concurrency),
+                "-x", str(concurrency),
+                "-k", "1M",
+                "-j", str(concurrency),
+                "--file-allocation=none",
+                "--summary-interval=0",
+            ]
+        }
+
+    return opts
+
+
+async def download_media_turbo(
+    url: str,
+    mode: str = "auto",
+    temp_dir: str | Path = "temp",
+    ydl_opts: Optional[dict] = None,
+    progress_callback: Optional[Callable[[int, int], Any]] = None,
+) -> Path:
+    """
+    Wrapper combining turbo downloader options with ytdl or segmented direct downloader.
+    """
+    temp_path = Path(temp_dir).resolve()
+    temp_path.mkdir(parents=True, exist_ok=True)
+
+    if mode == "direct":
+        # Extract filename from URL or assign fallback
+        clean_url = url.split("?")[0].rstrip("/")
+        name = clean_url.split("/")[-1] or f"media_{int(time.time())}"
+        dest_file = temp_path / name
+        downloader = SegmentedChunkDownloader(concurrency=8)
+        return await downloader.download(
+            url=url,
+            destination_file=dest_file,
+            progress_callback=progress_callback,
+        )
+
+    # yt-dlp turbo fragment extraction
+    import yt_dlp
+
+    opts = get_turbo_downloader_opts(base_opts=ydl_opts, concurrency=8)
+    if "outtmpl" not in opts:
+        opts["outtmpl"] = str(temp_path / "%(id)s.%(ext)s")
+
+    def _sync_ytdl_download():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info:
+                if "requested_downloads" in info and info["requested_downloads"]:
+                    target = info["requested_downloads"][0].get("filepath")
+                    if target and Path(target).exists():
+                        return Path(target)
+                target = ydl.prepare_filename(info)
+                if Path(target).exists():
+                    return Path(target)
+                candidates = list(temp_path.glob(f"{info.get('id', '')}.*"))
+                if candidates:
+                    return candidates[0]
+            files = [p for p in temp_path.iterdir() if p.is_file() and not p.name.endswith(".part")]
+            if files:
+                return max(files, key=lambda f: f.stat().st_mtime)
+            raise FileNotFoundError(f"yt-dlp downloaded media file not found in {temp_path}")
+
+    return await asyncio.to_thread(_sync_ytdl_download)
+
