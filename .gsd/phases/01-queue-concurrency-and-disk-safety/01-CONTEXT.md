@@ -29,9 +29,17 @@ Eliminate all user cookie requirements by utilizing modern client emulation and 
   Includes an interactive `[❌ Cancel Queue]` button.
 - **D-07 (Download Cancellation):** Users can cancel queued or active downloads via button click or `/cancel`. Cancelling an active download immediately terminates the worker thread and removes the temporary download folder.
 
-### 3. Termux Disk Safety & Headroom
-- **D-08 (Disk Headroom Guard):** Before downloading, check available storage in the working volume (`shutil.disk_usage`). If free disk space is less than 500 MB (or 1.5x expected media size), reject download with a clear advisory to free up phone storage.
-- **D-09 (Garbage Collection):** On bot startup and after every download completion/failure/cancellation, sweep and delete orphaned `.part`, `.ytdl`, `.temp`, and stale `dl_*` folders.
+### 3. Parallel Segmented Chunk Downloading (Turbo 40Mbps Saturation)
+- **D-08 (DASH/HLS Multi-Stream):** For YouTube and fragmented formats, enforce `concurrent_fragment_downloads: 8` with 10MB chunk buffers to saturate the user's 40 Mbps connection.
+- **D-09 (Direct HTTP Multi-Chunk Assembler):** For single progressive video files (Instagram, Twitter, TikTok, direct web links), implement an async parallel byte-range downloader:
+  - Verifies `Accept-Ranges: bytes` header and file size.
+  - Spawns 4-8 parallel worker streams downloading indexed chunk parts (`part_00`, `part_01`, etc.).
+  - Reassembles parts sequentially into final output with byte-length integrity verification (zero data loss).
+- **D-10 (Optional aria2c Auto-Detection):** If `aria2c` is installed in Termux (`which aria2c`), allow `yt-dlp` to pass `--external-downloader aria2c --external-downloader-args "-s 8 -x 8 -k 1M"` for native C-level socket acceleration.
+
+### 4. Termux Disk Safety & Headroom
+- **D-11 (Disk Headroom Guard):** Before downloading, check available storage in the working volume (`shutil.disk_usage`). If free disk space is less than 500 MB (or 1.5x expected media size), reject download with a clear advisory to free up phone storage.
+- **D-12 (Garbage Collection):** On bot startup and after every download completion/failure/cancellation, sweep and delete orphaned `.part`, `.ytdl`, `.temp`, and stale `dl_*` folders.
 
 ### Antigravity's Discretion
 - Choice of async queue implementation (using `asyncio.Queue` or a bounded semaphore).
@@ -51,3 +59,4 @@ Eliminate all user cookie requirements by utilizing modern client emulation and 
 - `fast_telethon.py` — Parallel MTProto upload engine.
 
 </canonical_refs>
+

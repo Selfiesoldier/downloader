@@ -18,12 +18,14 @@
 
 ## Phases
 
-### Phase 1: Download Queueing, Concurrency Limits & Cookieless Extraction
+### Phase 1: Download Queueing, Concurrency Limits & Turbo Parallel Chunking
 **Status:** 🟡 Ready for Planning  
-**Objective:** Eliminate user cookie requirements by utilizing modern client emulation and resolver fallbacks, while protecting Android Termux resources via a strict single-worker FIFO download queue, user cancellation, and automated temporary disk space cleanup.  
+**Objective:** Eliminate user cookie requirements by utilizing modern client emulation and resolver fallbacks, saturate 40 Mbps bandwidth via parallel multi-chunk segmented downloads with zero data loss, while protecting Android Termux resources via a strict single-worker FIFO download queue, user cancellation, and automated temporary disk space cleanup.  
 **Deliverables:**
 - Cookieless YouTube extraction using `visionos` and `android_vr` client rotation.
 - Automated cookieless fallback resolver for Instagram (embed CDN / Cobalt resolver) and Twitter (`api.fxtwitter.com`).
+- Parallel segmented chunk downloader (4-8 concurrent byte-range pipes with chunk ID indexing and seamless zero-loss assembly).
+- `aria2c` auto-detection for native socket acceleration if installed.
 - Async download task queue manager with single-worker concurrency (`asyncio.Queue` / semaphore).
 - Interactive "Cancel Download" inline button terminating active `yt-dlp` processes.
 - Startup and post-download garbage collection for orphaned `dl_*` temp directories and stale `.part` files.
