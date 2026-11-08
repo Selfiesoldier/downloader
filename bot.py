@@ -338,7 +338,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🤖 **Reddit** (Clips with sound)\n"
         "• 📘 **Facebook** (Reels & Videos)\n"
         "• ☁️ **SoundCloud** (High quality MP3)\n\n"
-        "✨ **Instant Cookieless Downloads:** No login or cookie setup required.\n"
+        "✨ **Instant Direct Downloads:** No accounts, logins, or setup required.\n"
         "👉 **Just paste your link below to download!**"
     )
     await update.message.reply_text(welcome_text, parse_mode=constants.ParseMode.MARKDOWN)
@@ -352,7 +352,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Choose your preferred quality (4K, 1080p, 720p, 480p, 360p, or MP3).\n"
         "4. The bot will download and deliver it directly to you!\n\n"
         "🚀 **2 GB File Limit:** Supports files up to **2,000 MB (2 GB)** with parallel MTProto upload speed!\n\n"
-        "⚡ **Zero Cookies Required:** Instant cookieless downloads powered by smart player client rotation and automatic resolver fallbacks."
+        "⚡ **Direct Download Engine:** Instant downloads powered by smart player client rotation and automatic resolver fallbacks."
     )
     await update.message.reply_text(help_text, parse_mode=constants.ParseMode.MARKDOWN)
 
