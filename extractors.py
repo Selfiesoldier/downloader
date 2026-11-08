@@ -30,11 +30,33 @@ def resolve_ffmpeg() -> str | None:
 FFMPEG_PATH = resolve_ffmpeg()
 
 
+def resolve_js_runtimes() -> dict[str, Any] | None:
+    """Locate available JavaScript runtimes (Node.js, Deno, Bun, QuickJS) for YouTube signature challenge solving."""
+    runtimes = {}
+    candidates = [
+        ("node", "/data/data/com.termux/files/usr/bin/node"),
+        ("deno", "/data/data/com.termux/files/usr/bin/deno"),
+        ("bun", "/data/data/com.termux/files/usr/bin/bun"),
+        ("quickjs", "/data/data/com.termux/files/usr/bin/qjs"),
+    ]
+    for name, termux_path in candidates:
+        if shutil.which(name):
+            runtimes[name] = {}
+            break
+        elif os.path.exists(termux_path) and os.access(termux_path, os.X_OK):
+            runtimes[name] = {"path": termux_path}
+            break
+    return runtimes if runtimes else None
+
+
+JS_RUNTIMES = resolve_js_runtimes()
+
+
 def get_cookieless_ydl_opts(url: str | None = None, extra_opts: dict | None = None) -> dict[str, Any]:
     """
-    Constructs cookieless yt-dlp configuration using modern player client rotation.
-    Emulates visionos and android_vr player clients for YouTube to bypass SABR bot checks,
-    zero PO token requirements, and zero Netscape cookies needed.
+    Constructs cookieless yt-dlp configuration with modern player client rotation
+    and native JavaScript challenge solving (via Node.js/Deno/QuickJS).
+    Bypasses bot checks without requiring cookies or account authentication.
     """
     opts: dict[str, Any] = {
         "quiet": True,
@@ -51,6 +73,7 @@ def get_cookieless_ydl_opts(url: str | None = None, extra_opts: dict | None = No
         "check_formats": False,
         "youtube_include_dash_manifest": True,
         "youtube_include_hls_manifest": False,
+        "remote_components": ["ejs:github"],
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -58,13 +81,10 @@ def get_cookieless_ydl_opts(url: str | None = None, extra_opts: dict | None = No
             ),
             "Accept-Language": "en-US,en;q=0.9",
         },
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["visionos", "android_vr"],
-                "player_skip": ["js", "configs", "webpage"],
-            }
-        },
     }
+
+    if JS_RUNTIMES:
+        opts["js_runtimes"] = JS_RUNTIMES
 
     if FFMPEG_PATH:
         opts["ffmpeg_location"] = FFMPEG_PATH
@@ -530,15 +550,55 @@ def extract_smart_formats(info: dict[str, Any]) -> tuple[list[dict[str, Any]], s
     return resolutions, audio_size_str
 
 
+def resolve_youtube(url: str, extra_opts: dict | None = None) -> dict[str, Any]:
+    """
+    YouTube extraction cascade:
+    1. Primary: Native multi-client extraction with JS challenge solving (provides 4K/1080p/720p/480p/audio).
+    2. Secondary: Fallback to Android + TV-embedded + iOS player client rotation if primary faces bot challenge.
+    """
+    primary_opts = get_cookieless_ydl_opts(url, extra_opts)
+    primary_opts.setdefault("extract_flat", False)
+    primary_opts.setdefault("skip_download", True)
+    primary_opts.setdefault("no_playlist", True)
+
+    try:
+        with yt_dlp.YoutubeDL(primary_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info and (info.get("url") or info.get("formats")):
+                return info
+    except Exception as primary_err:
+        logger.warning(f"Primary YouTube extraction failed ({primary_err}). Cascading to mobile/TV client rotation...")
+        fallback_opts = get_cookieless_ydl_opts(url, extra_opts)
+        fallback_opts.setdefault("extract_flat", False)
+        fallback_opts.setdefault("skip_download", True)
+        fallback_opts.setdefault("no_playlist", True)
+        fallback_opts.setdefault("extractor_args", {})
+        fallback_opts["extractor_args"]["youtube"] = {
+            "player_client": ["android", "tv_embedded", "ios"]
+        }
+        try:
+            with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info and (info.get("url") or info.get("formats")):
+                    return info
+        except Exception as fb_err:
+            logger.error(f"Fallback YouTube extraction also failed: {fb_err}")
+            raise primary_err
+
+    raise RuntimeError(f"Could not extract playable stream formats from YouTube URL: {url}")
+
+
 def extract_media_info(url: str, extra_opts: dict | None = None) -> dict[str, Any]:
     """
     Main entry point for extracting media metadata without cookies:
     Routes URLs to their specialized platform resolvers or native yt-dlp with
-    cookieless visionos/android_vr player client rotation.
+    cookieless cascades.
     """
     url_lower = url.lower()
 
-    if "instagram.com" in url_lower or "instagr.am" in url_lower:
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return resolve_youtube(url, extra_opts)
+    elif "instagram.com" in url_lower or "instagr.am" in url_lower:
         return resolve_instagram(url, extra_opts)
     elif "twitter.com" in url_lower or "x.com" in url_lower:
         return resolve_twitter(url, extra_opts)
@@ -547,7 +607,7 @@ def extract_media_info(url: str, extra_opts: dict | None = None) -> dict[str, An
     elif "reddit.com" in url_lower or "redd.it" in url_lower:
         return resolve_reddit(url, extra_opts)
 
-    # YouTube and general platforms
+    # General platforms
     opts = get_cookieless_ydl_opts(url, extra_opts)
     opts.setdefault("extract_flat", False)
     opts.setdefault("skip_download", True)
@@ -565,6 +625,10 @@ class CookielessExtractorEngine:
     @staticmethod
     def get_ydl_opts(url: str | None = None, extra_opts: dict | None = None) -> dict[str, Any]:
         return get_cookieless_ydl_opts(url, extra_opts)
+
+    @classmethod
+    def resolve_youtube(cls, url: str, extra_opts: dict | None = None) -> dict[str, Any]:
+        return resolve_youtube(url, extra_opts)
 
     @classmethod
     def resolve_instagram(cls, url: str, extra_opts: dict | None = None) -> dict[str, Any]:

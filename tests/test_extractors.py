@@ -5,6 +5,7 @@ import extractors
 from extractors import (
     CookielessExtractorEngine,
     get_cookieless_ydl_opts,
+    resolve_youtube,
     resolve_twitter,
     resolve_instagram,
     resolve_tiktok,
@@ -13,25 +14,36 @@ from extractors import (
 
 
 class TestCookielessExtractors(unittest.TestCase):
-    def test_youtube_opts_visionos_android_vr(self):
-        """Verify get_cookieless_ydl_opts configures player_client with visionos and android_vr."""
+    def test_youtube_cookieless_opts(self):
+        """Verify get_cookieless_ydl_opts configures remote challenge solver and preserves JS decoding."""
         opts = get_cookieless_ydl_opts("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         
-        self.assertIn("extractor_args", opts)
-        self.assertIn("youtube", opts["extractor_args"])
-        player_client = opts["extractor_args"]["youtube"].get("player_client", [])
-        player_skip = opts["extractor_args"]["youtube"].get("player_skip", [])
-        
-        self.assertIn("visionos", player_client)
-        self.assertIn("android_vr", player_client)
-        self.assertNotIn("web", player_client)
-        
-        self.assertIn("js", player_skip)
-        self.assertIn("configs", player_skip)
-        self.assertIn("webpage", player_skip)
-        
+        self.assertIn("ejs:github", opts.get("remote_components", []))
+        self.assertNotIn("player_skip", opts.get("extractor_args", {}).get("youtube", {}))
         self.assertTrue(opts.get("youtube_include_dash_manifest"))
         self.assertFalse(opts.get("check_formats"))
+
+    @patch("extractors.yt_dlp.YoutubeDL")
+    def test_youtube_cascade_fallback(self, mock_ydl_cls):
+        """Verify resolve_youtube cascades to mobile/TV client rotation if primary fails."""
+        mock_primary = MagicMock()
+        mock_primary.__enter__.return_value = mock_primary
+        mock_primary.extract_info.side_effect = RuntimeError("Sign in to confirm you're not a bot")
+
+        mock_fallback = MagicMock()
+        mock_fallback.__enter__.return_value = mock_fallback
+        mock_fallback.extract_info.return_value = {
+            "id": "jNQXAC9IVRw",
+            "title": "Me at the zoo",
+            "formats": [{"url": "https://rr.googlevideo.com/videoplayback?id=123", "format_id": "18"}],
+        }
+
+        mock_ydl_cls.side_effect = [mock_primary, mock_fallback]
+
+        info = resolve_youtube("https://www.youtube.com/watch?v=jNQXAC9IVRw")
+        self.assertEqual(info["id"], "jNQXAC9IVRw")
+        self.assertEqual(len(info["formats"]), 1)
+        self.assertEqual(mock_ydl_cls.call_count, 2)
 
     @patch("extractors.yt_dlp.YoutubeDL")
     @patch("extractors._http_get")

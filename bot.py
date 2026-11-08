@@ -328,6 +328,22 @@ def download_media_sync(
             return files, None
     except Exception as e:
         logger.warning(f"Download with primary URL failed ({e}). Checking direct fallback URL...")
+        if "youtube.com" in url.lower() or "youtu.be" in url.lower():
+            try:
+                logger.info("Attempting YouTube download retry with mobile/TV client rotation...")
+                yt_fallback_opts = _build_opts(url)
+                yt_fallback_opts.setdefault("extractor_args", {})
+                yt_fallback_opts["extractor_args"]["youtube"] = {
+                    "player_client": ["android", "tv_embedded", "ios"]
+                }
+                with yt_dlp.YoutubeDL(yt_fallback_opts) as yt_ydl:
+                    yt_ydl.extract_info(url, download=True)
+                files = _find_files()
+                if files:
+                    return files, None
+            except Exception as yt_err:
+                logger.warning(f"YouTube client rotation retry failed: {yt_err}")
+
         if direct_url and direct_url != url:
             try:
                 fallback_opts = _build_opts(direct_url)
