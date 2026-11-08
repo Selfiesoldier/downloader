@@ -113,3 +113,4 @@ sequenceDiagram
 - [ ] **Progress Updates on Slow Connections:** `edit_message_text` progress updates can occasionally trigger Telegram rate limits (`RetryAfter`) during 100MB+ transfers.
 - [ ] **Playlist Batch Downloading:** Playlists are currently forced to `no_playlist: True`. Batch/archive downloading is not yet implemented.
 - [ ] **Cookie Expiration Notification:** When a cookie session expires, the bot only catches the error when a download fails rather than proactively alerting the owner.
+

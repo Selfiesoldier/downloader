@@ -46,3 +46,4 @@
 | `OWNER_USER_ID` | No | None | Numeric Telegram ID authorized to upload cookies via chat | `.env` |
 | `MAX_FILE_SIZE_MB` | No | `2000` | Upper size limit in megabytes | `.env` |
 | `COOKIES_FILE` | No | None | Explicit path override for Netscape cookies | `.env` |
+
