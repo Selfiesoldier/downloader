@@ -259,10 +259,14 @@ def download_media_sync(
     with automatic fallback to direct stream URL if native extraction meets login walls.
     Supports mid-stream cancellation via cancel_event.
     """
-    out_tmpl = os.path.join(temp_dir, "%(title).50s [%(id)s].%(ext)s")
+    out_tmpl = os.path.join(temp_dir, "%(title).35s [%(id).15s].%(ext)s")
 
     def _build_opts(target_url: str) -> dict:
-        extra: dict = {}
+        extra: dict = {
+            "trim_file_name": 60,
+            "windowsfilenames": True,
+            "restrictfilenames": False,
+        }
         if cancel_event:
             def _check_cancel(d):
                 if cancel_event.is_set():
@@ -270,38 +274,44 @@ def download_media_sync(
             extra["progress_hooks"] = [_check_cancel]
 
         if mode == "audio":
-            extra.update({
+            extra_audio: dict = {
                 "format": "bestaudio/best",
                 "outtmpl": out_tmpl,
-                "postprocessors": [{
+            }
+            if FFMPEG_PATH:
+                extra_audio["postprocessors"] = [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
-                }],
-            })
+                }]
+            extra.update(extra_audio)
             return get_ydl_opts(extra, url=target_url)
         elif mode.isdigit():
             height = int(mode)
             # Match both height and width so vertical shorts/reels (e.g. 1080x1920) work perfectly
+            fmt = (
+                f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[width<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={height}]+bestaudio/"
+                f"bestvideo[width<={height}]+bestaudio/"
+                f"best[height<={height}]/"
+                f"best[width<={height}]/"
+                f"best"
+            ) if FFMPEG_PATH else (
+                f"best[height<={height}]/best[width<={height}]/best"
+            )
             extra.update({
-                "format": (
-                    f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-                    f"bestvideo[width<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-                    f"bestvideo[height<={height}]+bestaudio/"
-                    f"bestvideo[width<={height}]+bestaudio/"
-                    f"best[height<={height}]/"
-                    f"best[width<={height}]/"
-                    f"best"
-                ),
+                "format": fmt,
                 "outtmpl": out_tmpl,
-                "merge_output_format": "mp4",
+                "merge_output_format": "mp4" if FFMPEG_PATH else None,
             })
             return get_ydl_opts(extra, url=target_url)
         else:  # video_best
+            fmt = "bestvideo+bestaudio/best" if FFMPEG_PATH else "best"
             extra.update({
-                "format": "bestvideo+bestaudio/best",
+                "format": fmt,
                 "outtmpl": out_tmpl,
-                "merge_output_format": "mp4",
+                "merge_output_format": "mp4" if FFMPEG_PATH else None,
             })
             return get_ydl_opts(extra, url=target_url)
 
@@ -327,6 +337,11 @@ def download_media_sync(
         if files:
             return files, None
     except Exception as e:
+        err_msg = str(e)
+        if (cancel_event and cancel_event.is_set()) or "cancelled by user" in err_msg.lower():
+            logger.info("Download cancelled by user, aborting immediately without fallbacks.")
+            return [], "Download cancelled by user"
+
         logger.warning(f"Download with primary URL failed ({e}). Checking direct fallback URL...")
         if "youtube.com" in url.lower() or "youtu.be" in url.lower():
             try:
@@ -347,6 +362,10 @@ def download_media_sync(
         if direct_url and direct_url != url:
             try:
                 fallback_opts = _build_opts(direct_url)
+                # Crucial: protect against CDN URLs with 500+ character query strings being used as filename
+                fallback_opts["outtmpl"] = os.path.join(temp_dir, "media.%(ext)s")
+                fallback_opts["trim_file_name"] = 50
+                fallback_opts["windowsfilenames"] = True
                 with yt_dlp.YoutubeDL(fallback_opts) as fallback_ydl:
                     fallback_ydl.extract_info(direct_url, download=True)
                 files = _find_files()

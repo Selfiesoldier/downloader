@@ -74,6 +74,9 @@ def get_cookieless_ydl_opts(url: str | None = None, extra_opts: dict | None = No
         "youtube_include_dash_manifest": True,
         "youtube_include_hls_manifest": False,
         "remote_components": ["ejs:github"],
+        "trim_file_name": 60,
+        "windowsfilenames": True,
+        "restrictfilenames": False,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

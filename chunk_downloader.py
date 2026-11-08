@@ -461,6 +461,9 @@ def get_turbo_downloader_opts(base_opts: Optional[dict] = None, concurrency: int
     opts["http_chunk_size"] = 10485760 # 10MB
     opts["retries"] = 5
     opts["fragment_retries"] = 5
+    opts["trim_file_name"] = 60
+    opts["windowsfilenames"] = True
+    opts["restrictfilenames"] = False
 
     aria2c_path = detect_aria2c()
     if aria2c_path:
@@ -509,7 +512,7 @@ async def download_media_turbo(
 
     opts = get_turbo_downloader_opts(base_opts=ydl_opts, concurrency=8)
     if "outtmpl" not in opts:
-        opts["outtmpl"] = str(temp_path / "%(id)s.%(ext)s")
+        opts["outtmpl"] = str(temp_path / "%(id).20s.%(ext)s")
 
     def _sync_ytdl_download():
         with yt_dlp.YoutubeDL(opts) as ydl:
