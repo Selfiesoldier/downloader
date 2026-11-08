@@ -335,6 +335,7 @@ class SegmentedChunkDownloader:
         destination_file: str | Path,
         progress_callback: Optional[Callable[[int, int], Any]] = None,
         headers: Optional[dict] = None,
+        client: Optional[httpx.AsyncClient] = None,
     ) -> Path:
         """
         Executes parallel multi-chunk download if supported, or streams single file directly.
@@ -343,14 +344,20 @@ class SegmentedChunkDownloader:
         dest_path = Path(destination_file).resolve()
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        async with httpx.AsyncClient(timeout=self.chunk_timeout, follow_redirects=True) as client:
-            content_length, supports_ranges = await self.inspect_url(url, headers=headers, client=client)
+        close_client = False
+        client_to_use = client
+        if client_to_use is None:
+            client_to_use = httpx.AsyncClient(timeout=self.chunk_timeout, follow_redirects=True)
+            close_client = True
+
+        try:
+            content_length, supports_ranges = await self.inspect_url(url, headers=headers, client=client_to_use)
 
             # Fallback to single-stream download if ranges not supported or size unknown
             if not supports_ranges or content_length is None or content_length <= 0:
                 logger.info("Direct range download not supported; falling back to single-stream")
                 req_headers = headers.copy() if headers else {}
-                async with client.stream("GET", url, headers=req_headers) as response:
+                async with client_to_use.stream("GET", url, headers=req_headers) as response:
                     response.raise_for_status()
                     total_len = int(response.headers.get("content-length", 0)) or 0
                     downloaded = 0
@@ -393,7 +400,7 @@ class SegmentedChunkDownloader:
                         end_byte=end,
                         part_path=chunks_dir / f"chunk_{idx:02d}.part",
                         tracker=tracker,
-                        client=client,
+                        client=client_to_use,
                         base_headers=headers,
                     )
                     for idx, (start, end) in enumerate(ranges)
@@ -411,6 +418,9 @@ class SegmentedChunkDownloader:
             finally:
                 if chunks_dir.exists():
                     shutil.rmtree(chunks_dir, ignore_errors=True)
+        finally:
+            if close_client:
+                await client_to_use.aclose()
 
 
 def detect_aria2c() -> Optional[str]:
