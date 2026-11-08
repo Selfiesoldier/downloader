@@ -16,5 +16,8 @@ downloads/
 *.session
 *.session-journal
 
-# Secrets
+# Secrets & Cookies
 .env
+cookies/
+*cookies*.txt
+*.cookies

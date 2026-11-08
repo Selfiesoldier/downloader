@@ -50,6 +50,14 @@ API_ID_STR = os.getenv("TELEGRAM_API_ID")
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 API_ID = int(API_ID_STR) if API_ID_STR and API_ID_STR.isdigit() else None
 
+# Optional Owner Telegram ID for administrative access (cookie management)
+OWNER_USER_ID_STR = os.getenv("OWNER_USER_ID")
+OWNER_USER_ID = int(OWNER_USER_ID_STR) if OWNER_USER_ID_STR and OWNER_USER_ID_STR.strip().isdigit() else None
+
+# Dedicated cookies storage directory
+COOKIES_DIR = BASE_DIR / "cookies"
+COOKIES_DIR.mkdir(parents=True, exist_ok=True)
+
 # Helper to locate FFmpeg binary safely across Windows, Linux, and Android Termux
 def resolve_ffmpeg() -> str | None:
     termux_ffmpeg = "/data/data/com.termux/files/usr/bin/ffmpeg"
@@ -73,6 +81,68 @@ URL_REGEX = re.compile(
     r'(https?://(?:www\.|(?!www))[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|www\.[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|https?://[^\s]+)',
     re.IGNORECASE
 )
+
+def resolve_cookies(url: str | None = None) -> str | None:
+    """
+    Locates the most specific active Netscape cookie file:
+    1. COOKIES_FILE from .env (if set and file exists)
+    2. Domain-specific cookie files:
+       - Instagram: cookies/instagram_cookies.txt, instagram_cookies.txt
+       - YouTube: cookies/youtube_cookies.txt, youtube_cookies.txt
+    3. Universal cookie file: cookies/cookies.txt, cookies.txt
+    """
+    env_cookies = os.getenv("COOKIES_FILE")
+    if env_cookies:
+        p = Path(env_cookies)
+        if not p.is_absolute():
+            p = BASE_DIR / p
+        if p.exists() and p.stat().st_size > 0:
+            return str(p)
+
+    domain_candidates = []
+    if url:
+        url_l = url.lower()
+        if "instagram.com" in url_l:
+            domain_candidates = [
+                COOKIES_DIR / "instagram_cookies.txt",
+                BASE_DIR / "instagram_cookies.txt",
+                COOKIES_DIR / "instagram.cookies",
+                COOKIES_DIR / "ig_cookies.txt",
+            ]
+        elif "youtube.com" in url_l or "youtu.be" in url_l:
+            domain_candidates = [
+                COOKIES_DIR / "youtube_cookies.txt",
+                BASE_DIR / "youtube_cookies.txt",
+                COOKIES_DIR / "youtube.cookies",
+                COOKIES_DIR / "yt_cookies.txt",
+            ]
+
+    for candidate in domain_candidates:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return str(candidate)
+
+    universal_candidates = [
+        COOKIES_DIR / "cookies.txt",
+        BASE_DIR / "cookies.txt",
+        COOKIES_DIR / "universal_cookies.txt",
+    ]
+    for candidate in universal_candidates:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return str(candidate)
+
+    return None
+
+def validate_netscape_cookies(content: str) -> bool:
+    """Verifies that the content contains standard Netscape/HTTP cookie records."""
+    if "# Netscape HTTP Cookie File" in content or "# HTTP Cookie File" in content:
+        return True
+    lines = [l.strip() for l in content.splitlines() if l.strip() and not l.startswith('#')]
+    valid_records = 0
+    for l in lines:
+        parts = l.split('\t')
+        if len(parts) >= 7:
+            valid_records += 1
+    return valid_records >= 2
 
 # Active cache of media info for callback handling
 MEDIA_CACHE = {}
@@ -114,7 +184,7 @@ def format_size_str(bytes_val: int) -> str:
     return f" (~{int(mb)}MB)"
 
 
-def get_ydl_opts(extra_opts: dict = None) -> dict:
+def get_ydl_opts(extra_opts: dict = None, url: str = None) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -128,9 +198,25 @@ def get_ydl_opts(extra_opts: dict = None) -> dict:
         "concurrent_fragment_downloads": 8,
         "buffersize": 1024 * 1024,
         "http_chunk_size": 10485760,
+        # YouTube Mobile & TV Player Client Rotation to bypass web bot checks
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+                "player_skip": ["js", "configs", "webpage"]
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
     }
     if FFMPEG_PATH:
         opts["ffmpeg_location"] = FFMPEG_PATH
+
+    cookie_path = resolve_cookies(url)
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+        logger.info(f"Loaded active cookie session: {Path(cookie_path).name}")
 
     if extra_opts:
         opts.update(extra_opts)
@@ -149,7 +235,7 @@ async def fetch_media_info(url: str) -> dict:
             "check_formats": False,
             "youtube_include_dash_manifest": True,
             "youtube_include_hls_manifest": False,
-        })
+        }, url=url)
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
@@ -267,7 +353,7 @@ def download_media_sync(url: str, mode: str, temp_dir: str) -> tuple[list[str], 
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }],
-        })
+        }, url=url)
     elif mode.isdigit():
         height = int(mode)
         # Match both height and width so vertical shorts/reels (e.g. 1080x1920) work perfectly
@@ -283,13 +369,13 @@ def download_media_sync(url: str, mode: str, temp_dir: str) -> tuple[list[str], 
             ),
             "outtmpl": out_tmpl,
             "merge_output_format": "mp4",
-        })
+        }, url=url)
     else:  # video_best
         opts = get_ydl_opts({
             "format": "bestvideo+bestaudio/best",
             "outtmpl": out_tmpl,
             "merge_output_format": "mp4",
-        })
+        }, url=url)
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -331,6 +417,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🤖 **Reddit** (Clips with sound)\n"
         "• 📘 **Facebook** (Reels & Videos)\n"
         "• ☁️ **SoundCloud** (High quality MP3)\n\n"
+        "🍪 Use /cookies to check or upload authenticated session cookies.\n"
         "👉 **Just paste your link below to download!**"
     )
     await update.message.reply_text(welcome_text, parse_mode=constants.ParseMode.MARKDOWN)
@@ -343,9 +430,103 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. Paste it in this chat.\n"
         "3. Choose your preferred quality (4K, 1080p, 720p, 480p, 360p, or MP3).\n"
         "4. The bot will download and deliver it directly to you!\n\n"
-        "🚀 **2 GB File Limit:** Unlike standard Telegram bots that crash on files over 50MB, this bot supports files up to **2,000 MB (2 GB)** with parallel MTProto upload speed!"
+        "🚀 **2 GB File Limit:** Supports files up to **2,000 MB (2 GB)** with parallel MTProto upload speed!\n\n"
+        "🍪 **Bypassing Bot/Login Checks:**\n"
+        "If YouTube asks for bot confirmation or Instagram requires login, send your `cookies.txt` directly to this chat or use /cookies."
     )
     await update.message.reply_text(help_text, parse_mode=constants.ParseMode.MARKDOWN)
+
+
+async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if OWNER_USER_ID and user_id != OWNER_USER_ID:
+        await update.message.reply_text("⛔ This command is reserved for the bot owner.")
+        return
+
+    yt_cookie = resolve_cookies("https://www.youtube.com")
+    ig_cookie = resolve_cookies("https://www.instagram.com")
+    univ_cookie = resolve_cookies()
+
+    yt_status = f"✅ Active (`{Path(yt_cookie).name}`)" if yt_cookie else "❌ Not configured"
+    ig_status = f"✅ Active (`{Path(ig_cookie).name}`)" if ig_cookie else "❌ Not configured"
+    univ_status = f"✅ Active (`{Path(univ_cookie).name}`)" if univ_cookie else "❌ Not configured"
+
+    msg = (
+        "🍪 **Session Cookies Dashboard**\n\n"
+        f"• 📺 **YouTube:** {yt_status}\n"
+        f"• 📸 **Instagram:** {ig_status}\n"
+        f"• 🌐 **Universal:** {univ_status}\n\n"
+        "**How to add or update cookies:**\n"
+        "1. Log in to YouTube / Instagram in your browser.\n"
+        "2. Use an extension (e.g. *Get cookies.txt LOCALLY*) to export Netscape cookies.\n"
+        "3. Send the `.txt` file directly into this chat as a document:\n"
+        "   • `youtube_cookies.txt` (for YouTube)\n"
+        "   • `instagram_cookies.txt` (for Instagram)\n"
+        "   • `cookies.txt` (universal for all sites)\n\n"
+        "✨ The bot will validate the format and activate your session immediately!"
+    )
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc:
+        return
+
+    user_id = update.effective_user.id
+    if OWNER_USER_ID and user_id != OWNER_USER_ID:
+        return
+
+    file_name = (doc.file_name or "").lower()
+    if not (file_name.endswith(".txt") or file_name.endswith(".cookies")):
+        return
+
+    caption = (update.message.caption or "").strip().lower()
+    is_cookie_file = "cookie" in file_name or caption in ("/setcookies", "/cookies", "cookies")
+    if not is_cookie_file:
+        return
+
+    status_msg = await update.message.reply_text("⏳ **Inspecting cookie file...**", parse_mode=constants.ParseMode.MARKDOWN)
+
+    try:
+        tg_file = await doc.get_file()
+        file_bytes = await tg_file.download_as_bytearray()
+        content = file_bytes.decode("utf-8", errors="replace")
+
+        if not validate_netscape_cookies(content):
+            await status_msg.edit_text(
+                "❌ **Invalid Cookie File Format!**\n\n"
+                "The file does not appear to be a standard Netscape/HTTP cookie format.\n"
+                "Please export using *Get cookies.txt LOCALLY* or standard Netscape format.",
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
+            return
+
+        # Determine target filename
+        if "instagram" in file_name or "instagram.com" in content:
+            target_name = "instagram_cookies.txt"
+            platform_name = "📸 Instagram"
+        elif "youtube" in file_name or "youtube.com" in content:
+            target_name = "youtube_cookies.txt"
+            platform_name = "📺 YouTube"
+        else:
+            target_name = "cookies.txt"
+            platform_name = "🌐 Universal (YouTube, Instagram & Web)"
+
+        target_path = COOKIES_DIR / target_name
+        with open(target_path, "wb") as f:
+            f.write(file_bytes)
+
+        await status_msg.edit_text(
+            f"✅ **Cookies Saved & Activated Successfully!**\n\n"
+            f"Platform: **{platform_name}**\n"
+            f"Saved to: `{target_path.name}` ({len(file_bytes)} bytes)\n\n"
+            f"🚀 All subsequent downloads will automatically use this authenticated session!",
+            parse_mode=constants.ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"Error saving cookie document: {e}")
+        await status_msg.edit_text(f"❌ Failed to save cookie file: `{e}`", parse_mode=constants.ParseMode.MARKDOWN)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,10 +552,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = await fetch_media_info(url)
     except Exception as e:
         logger.error(f"Error fetching info for {url}: {e}")
+        err_str = str(e)
+        err_lower = err_str.lower()
+        if "confirm you're not a bot" in err_lower or "sign in to confirm" in err_lower:
+            error_guidance = (
+                "❌ **YouTube Anti-Bot Check Triggered!**\n\n"
+                "YouTube is requesting bot verification for this video/IP.\n\n"
+                "💡 **Solution:** Send your `youtube_cookies.txt` or `cookies.txt` file directly into this chat.\n"
+                "Type /cookies for instructions."
+            )
+        elif "login required" in err_lower or "checkpoint_required" in err_lower or "rate-limit" in err_lower:
+            error_guidance = (
+                "❌ **Instagram Login Required!**\n\n"
+                "Instagram requires an active logged-in session to access this reel/post.\n\n"
+                "💡 **Solution:** Send your `instagram_cookies.txt` directly into this chat.\n"
+                "Type /cookies for instructions."
+            )
+        else:
+            error_guidance = (
+                f"❌ **Failed to fetch media.**\n\n"
+                f"Reason: `{err_str[:150]}`\n\n"
+                "Please make sure the link is public and still available."
+            )
+
         await status_msg.edit_text(
-            f"❌ **Failed to fetch media.**\n\n"
-            f"Reason: `{str(e)[:150]}`\n\n"
-            "Please make sure the link is public and still available.",
+            error_guidance,
             parse_mode=constants.ParseMode.MARKDOWN
         )
         return
@@ -714,7 +916,9 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("cookies", cookies_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
