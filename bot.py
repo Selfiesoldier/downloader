@@ -144,6 +144,19 @@ def validate_netscape_cookies(content: str) -> bool:
             valid_records += 1
     return valid_records >= 2
 
+async def safe_edit_message(message, text: str, **kwargs):
+    """Safely edit a Telegram message with retry on mobile network drops."""
+    for attempt in range(2):
+        try:
+            return await message.edit_text(text, **kwargs)
+        except (telegram.error.NetworkError, telegram.error.TimedOut) as err:
+            logger.warning(f"Telegram network blip editing message (attempt {attempt+1}): {err}")
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            logger.warning(f"Failed to edit message: {e}")
+            break
+    return None
+
 # Active cache of media info for callback handling
 MEDIA_CACHE = {}
 
@@ -198,13 +211,6 @@ def get_ydl_opts(extra_opts: dict = None, url: str = None) -> dict:
         "concurrent_fragment_downloads": 8,
         "buffersize": 1024 * 1024,
         "http_chunk_size": 10485760,
-        # YouTube Mobile & TV Player Client Rotation to bypass web bot checks
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
-                "player_skip": ["js", "configs", "webpage"]
-            }
-        },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
@@ -216,7 +222,22 @@ def get_ydl_opts(extra_opts: dict = None, url: str = None) -> dict:
     cookie_path = resolve_cookies(url)
     if cookie_path:
         opts["cookiefile"] = cookie_path
+        # Authenticated: web and mobile formats both work cleanly
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["web", "android", "mweb"],
+                "player_skip": ["js", "configs", "webpage"]
+            }
+        }
         logger.info(f"Loaded active cookie session: {Path(cookie_path).name}")
+    else:
+        # Anonymous without cookies: use mobile android/ios to minimize web bot challenges
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["android", "ios"],
+                "player_skip": ["js", "configs", "webpage"]
+            }
+        }
 
     if extra_opts:
         opts.update(extra_opts)
@@ -494,7 +515,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         content = file_bytes.decode("utf-8", errors="replace")
 
         if not validate_netscape_cookies(content):
-            await status_msg.edit_text(
+            await safe_edit_message(
+                status_msg,
                 "❌ **Invalid Cookie File Format!**\n\n"
                 "The file does not appear to be a standard Netscape/HTTP cookie format.\n"
                 "Please export using *Get cookies.txt LOCALLY* or standard Netscape format.",
@@ -517,7 +539,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(target_path, "wb") as f:
             f.write(file_bytes)
 
-        await status_msg.edit_text(
+        await safe_edit_message(
+            status_msg,
             f"✅ **Cookies Saved & Activated Successfully!**\n\n"
             f"Platform: **{platform_name}**\n"
             f"Saved to: `{target_path.name}` ({len(file_bytes)} bytes)\n\n"
@@ -526,7 +549,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"Error saving cookie document: {e}")
-        await status_msg.edit_text(f"❌ Failed to save cookie file: `{e}`", parse_mode=constants.ParseMode.MARKDOWN)
+        await safe_edit_message(status_msg, f"❌ Failed to save cookie file: `{e}`", parse_mode=constants.ParseMode.MARKDOWN)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -575,7 +598,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Please make sure the link is public and still available."
             )
 
-        await status_msg.edit_text(
+        await safe_edit_message(
+            status_msg,
             error_guidance,
             parse_mode=constants.ParseMode.MARKDOWN
         )
@@ -626,7 +650,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👇 **Choose your preferred format / quality:**"
     )
 
-    await status_msg.edit_text(
+    await safe_edit_message(
+        status_msg,
         caption_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=constants.ParseMode.MARKDOWN
