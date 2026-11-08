@@ -7,6 +7,7 @@ import re
 import shutil
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -34,6 +35,8 @@ from extractors import (
     extract_smart_formats,
     extract_media_info,
 )
+from chunk_downloader import get_turbo_downloader_opts
+from queue_manager import DownloadQueueManager, DownloadJob
 
 # --- LOGGING CONFIGURATION ---
 logging.basicConfig(
@@ -169,6 +172,9 @@ MEDIA_CACHE = {}
 # Global Telethon client instance (for high-speed 2GB uploads)
 telethon_client: TelegramClient | None = None
 
+# Single-Worker FIFO Download Queue Manager (Termux / Low-Resource Protection)
+queue_manager = DownloadQueueManager()
+
 
 def detect_platform(url: str) -> str:
     url_l = url.lower()
@@ -204,8 +210,9 @@ def format_size_str(bytes_val: int) -> str:
 
 
 def get_ydl_opts(extra_opts: dict = None, url: str = None) -> dict:
-    """Cookieless ydl options wrapper with optional admin cookie injection."""
+    """Cookieless ydl options wrapper with turbo fragment acceleration and optional admin cookie injection."""
     opts = get_cookieless_ydl_opts(url=url, extra_opts=extra_opts)
+    opts = get_turbo_downloader_opts(opts, concurrency=8)
     cookie_path = resolve_cookies(url)
     if cookie_path:
         opts["cookiefile"] = cookie_path
@@ -239,17 +246,31 @@ def extract_available_formats(info: dict) -> tuple[list[dict], str]:
     return extract_smart_formats(info)
 
 
-def download_media_sync(url: str, mode: str, temp_dir: str, direct_url: str | None = None) -> tuple[list[str], str | None]:
+def download_media_sync(
+    url: str,
+    mode: str,
+    temp_dir: str,
+    direct_url: str | None = None,
+    cancel_event: asyncio.Event | None = None,
+) -> tuple[list[str], str | None]:
     """
     Downloads media to isolated temp_dir synchronously.
     Handles single videos, audio, movies, and multi-video carousels cleanly,
     with automatic fallback to direct stream URL if native extraction meets login walls.
+    Supports mid-stream cancellation via cancel_event.
     """
     out_tmpl = os.path.join(temp_dir, "%(title).50s [%(id)s].%(ext)s")
 
     def _build_opts(target_url: str) -> dict:
+        extra: dict = {}
+        if cancel_event:
+            def _check_cancel(d):
+                if cancel_event.is_set():
+                    raise Exception("Download cancelled by user")
+            extra["progress_hooks"] = [_check_cancel]
+
         if mode == "audio":
-            return get_ydl_opts({
+            extra.update({
                 "format": "bestaudio/best",
                 "outtmpl": out_tmpl,
                 "postprocessors": [{
@@ -257,11 +278,12 @@ def download_media_sync(url: str, mode: str, temp_dir: str, direct_url: str | No
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
                 }],
-            }, url=target_url)
+            })
+            return get_ydl_opts(extra, url=target_url)
         elif mode.isdigit():
             height = int(mode)
             # Match both height and width so vertical shorts/reels (e.g. 1080x1920) work perfectly
-            return get_ydl_opts({
+            extra.update({
                 "format": (
                     f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
                     f"bestvideo[width<={height}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -273,13 +295,15 @@ def download_media_sync(url: str, mode: str, temp_dir: str, direct_url: str | No
                 ),
                 "outtmpl": out_tmpl,
                 "merge_output_format": "mp4",
-            }, url=target_url)
+            })
+            return get_ydl_opts(extra, url=target_url)
         else:  # video_best
-            return get_ydl_opts({
+            extra.update({
                 "format": "bestvideo+bestaudio/best",
                 "outtmpl": out_tmpl,
                 "merge_output_format": "mp4",
-            }, url=target_url)
+            })
+            return get_ydl_opts(extra, url=target_url)
 
     valid_exts = {".mp4", ".m4a", ".webm", ".mp3", ".mkv", ".mov"}
 
@@ -556,6 +580,264 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def execute_download_job(job: DownloadJob):
+    """Worker task executing media download and Telegram delivery with strict resource boundaries."""
+    if job.cancel_event.is_set():
+        return
+
+    msg = job.extra.get("message")
+    mode_label = job.extra.get("mode_label", "Media")
+    title = job.title
+    url = job.url
+    mode = job.mode
+    direct_url = job.extra.get("direct_url")
+    author = job.extra.get("author", "Unknown")
+    platform = job.extra.get("platform", "Media")
+    duration = job.extra.get("duration", 0)
+    chat_id = job.chat_id
+    context = job.extra.get("context")
+    was_queued = job.extra.get("was_queued", False)
+
+    cancel_btn = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel:{job.job_id}")
+    ]])
+
+    # If this job was waiting in queue, now inform the user that it started downloading
+    if was_queued and msg and not job.cancel_event.is_set():
+        await safe_edit_message(
+            msg,
+            f"📥 **Downloading {mode_label}...**\n"
+            f"Title: `{title[:60]}`\n\n"
+            "⏳ Please wait a few moments...",
+            reply_markup=cancel_btn,
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+
+    temp_dir = tempfile.mkdtemp(prefix=f"dl_{job.job_id}_")
+    job.temp_dir = temp_dir
+    loop = asyncio.get_running_loop()
+
+    try:
+        if job.cancel_event.is_set():
+            return
+
+        file_paths, err = await loop.run_in_executor(
+            None,
+            download_media_sync,
+            url,
+            mode,
+            temp_dir,
+            direct_url,
+            job.cancel_event,
+        )
+
+        if job.cancel_event.is_set():
+            return
+
+        if err or not file_paths:
+            if not job.cancel_event.is_set():
+                logger.error(f"Download failed for {url}: {err}")
+                if msg:
+                    await safe_edit_message(
+                        msg,
+                        f"❌ **Download failed:** `{str(err)[:120]}`\n\n"
+                        "Try choosing **Audio (MP3)** or another resolution.",
+                        parse_mode=constants.ParseMode.MARKDOWN,
+                    )
+            return
+
+        total_files = len(file_paths)
+
+        for idx, file_path in enumerate(file_paths):
+            if job.cancel_event.is_set():
+                return
+
+            file_size = os.path.getsize(file_path)
+            file_size_mb = file_size / (1024 * 1024)
+
+            # Check 2GB hard ceiling
+            if file_size > MAX_TELEGRAM_BYTES:
+                if msg:
+                    await safe_edit_message(
+                        msg,
+                        f"⚠️ **File exceeds 2,000 MB ({file_size_mb:.1f} MB)!**\n\n"
+                        "Telegram has a 2 GB absolute maximum file limit.\n"
+                        "💡 Try selecting **Audio (MP3)** or a lower resolution.",
+                        parse_mode=constants.ParseMode.MARKDOWN,
+                    )
+                return
+
+            prefix = f"[{idx + 1}/{total_files}] " if total_files > 1 else ""
+            caption = (
+                f"🎬 <b>{prefix}{html.escape(title[:65])}</b>\n"
+                f"👤 {html.escape(author[:40])} • {platform}\n"
+                f"🤖 Downloaded with @Download_agent01_bot"
+            )
+
+            # 🚀 HIGH-SPEED TELETHON MTPROTO ENGINE (for ALL uploads when connected)
+            if telethon_client and telethon_client.is_connected():
+                if msg and not job.cancel_event.is_set():
+                    await safe_edit_message(
+                        msg,
+                        f"🚀 **Uploading {prefix}({file_size_mb:.1f} MB)...**\n"
+                        "⚡ High-Speed MTProto Engine active\n\n"
+                        "⏳ Initializing upload stream...",
+                        reply_markup=cancel_btn,
+                        parse_mode=constants.ParseMode.MARKDOWN,
+                    )
+
+                upload_stats = {"current": 0, "total": file_size}
+                upload_done = asyncio.Event()
+
+                def sync_progress(cur, tot):
+                    upload_stats["current"] = cur
+                    upload_stats["total"] = tot
+
+                async def progress_notifier():
+                    while not upload_done.is_set() and not job.cancel_event.is_set():
+                        await asyncio.sleep(2.5)
+                        if upload_done.is_set() or job.cancel_event.is_set():
+                            break
+                        cur = upload_stats["current"]
+                        tot = upload_stats["total"]
+                        pct = int((cur / tot) * 100) if tot else 0
+                        cur_mb = cur / (1024 * 1024)
+                        tot_mb = tot / (1024 * 1024)
+                        bar = '█' * (pct // 10) + '░' * (10 - pct // 10)
+                        if msg:
+                            await safe_edit_message(
+                                msg,
+                                f"📤 **Uploading {prefix}to Telegram ({pct}%)**\n"
+                                f"`[{bar}]` ({cur_mb:.1f} / {tot_mb:.1f} MB)",
+                                reply_markup=cancel_btn,
+                                parse_mode=constants.ParseMode.MARKDOWN,
+                            )
+
+                notifier_task = asyncio.create_task(progress_notifier())
+
+                try:
+                    # Turbo upload: 512KB chunks with 8 concurrent upload pipes
+                    input_file = await fast_upload_file(
+                        telethon_client,
+                        file_path,
+                        progress_callback=sync_progress,
+                        concurrency=8,
+                    )
+                finally:
+                    upload_done.set()
+                    notifier_task.cancel()
+
+                if job.cancel_event.is_set():
+                    return
+
+                if mode == "audio" or file_path.endswith(".mp3"):
+                    attributes = [DocumentAttributeAudio(duration=int(duration or 0), title=title[:60], performer=author[:40])]
+                    await telethon_client.send_file(
+                        chat_id,
+                        input_file,
+                        caption=caption,
+                        parse_mode="html",
+                        attributes=attributes,
+                    )
+                else:
+                    vid_w = job.extra.get("width")
+                    vid_h = job.extra.get("height")
+                    if mode.isdigit():
+                        target_h = int(mode)
+                        if vid_h and vid_w:
+                            vid_w = int(target_h * (vid_w / vid_h))
+                            vid_h = target_h
+                        else:
+                            vid_h = target_h
+                            vid_w = int(target_h * 16 / 9)
+                    vid_w = int(vid_w or 1280)
+                    vid_h = int(vid_h or 720)
+
+                    attributes = [
+                        DocumentAttributeVideo(
+                            duration=int(duration or 0),
+                            w=vid_w,
+                            h=vid_h,
+                            supports_streaming=True,
+                        )
+                    ]
+                    await telethon_client.send_file(
+                        chat_id,
+                        input_file,
+                        caption=caption,
+                        parse_mode="html",
+                        supports_streaming=True,
+                        attributes=attributes,
+                    )
+            else:
+                # 📦 FALLBACK: STANDARD BOT API (for files <= 50MB if Telethon is offline)
+                if file_size > 50 * 1024 * 1024:
+                    if msg:
+                        await safe_edit_message(
+                            msg,
+                            f"❌ **File is {file_size_mb:.1f} MB.**\n"
+                            "Telethon MTProto engine is offline, and standard Bot API is capped at 50 MB.",
+                            parse_mode=constants.ParseMode.MARKDOWN,
+                        )
+                    return
+
+                if msg and not job.cancel_event.is_set():
+                    await safe_edit_message(
+                        msg,
+                        f"📤 **Uploading {prefix}to Telegram ({file_size_mb:.1f} MB)...**",
+                        reply_markup=cancel_btn,
+                        parse_mode=constants.ParseMode.MARKDOWN,
+                    )
+
+                if job.cancel_event.is_set():
+                    return
+
+                if mode == "audio" or file_path.endswith(".mp3"):
+                    with open(file_path, "rb") as f:
+                        await context.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=f,
+                            title=f"{prefix}{title[:55]}",
+                            performer=author[:40],
+                            caption=caption,
+                            parse_mode=constants.ParseMode.HTML,
+                            read_timeout=300,
+                            write_timeout=300,
+                        )
+                else:
+                    with open(file_path, "rb") as f:
+                        await context.bot.send_video(
+                            chat_id=chat_id,
+                            video=f,
+                            caption=caption,
+                            supports_streaming=True,
+                            parse_mode=constants.ParseMode.HTML,
+                            read_timeout=300,
+                            write_timeout=300,
+                        )
+
+        if not job.cancel_event.is_set() and msg:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+
+    except Exception as e:
+        if job.cancel_event.is_set():
+            logger.info(f"Job {job.job_id} cancelled during processing.")
+        else:
+            logger.error(f"Error processing job {job.job_id}: {e}", exc_info=True)
+            if msg:
+                await safe_edit_message(
+                    msg,
+                    f"❌ **Error sending file:** `{str(e)[:120]}`",
+                    parse_mode=constants.ParseMode.MARKDOWN,
+                )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        job.temp_dir = ""
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -583,195 +865,108 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration = media_data.get("duration", 0)
 
     mode_label = f"🎬 {mode}p Video" if mode.isdigit() else ("🎵 MP3 Audio" if mode == "audio" else "🎬 Video")
+    job_id = uuid.uuid4().hex[:8]
 
-    await query.edit_message_text(
-        f"📥 **Downloading {mode_label}...**\n"
-        f"Title: `{title[:60]}`\n\n"
-        "⏳ Please wait a few moments...",
-        parse_mode=constants.ParseMode.MARKDOWN
+    # Check whether the queue worker is already busy with an active download
+    is_busy = queue_manager.is_busy()
+
+    cancel_btn = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel:{job_id}")
+    ]])
+    cancel_queue_btn = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel Queue", callback_data=f"cancel:{job_id}")
+    ]])
+
+    if is_busy:
+        pos = queue_manager.waiting_count + 1
+        ticket_text = (
+            f"⏳ **You are in queue (#{pos}).**\n"
+            f"Download will start automatically when current task finishes."
+        )
+        await safe_edit_message(
+            query.message,
+            ticket_text,
+            reply_markup=cancel_queue_btn,
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+    else:
+        status_text = (
+            f"📥 **Downloading {mode_label}...**\n"
+            f"Title: `{title[:60]}`\n\n"
+            "⏳ Please wait a few moments..."
+        )
+        await safe_edit_message(
+            query.message,
+            status_text,
+            reply_markup=cancel_btn,
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+
+    job = DownloadJob(
+        job_id=job_id,
+        chat_id=query.message.chat_id,
+        user_id=update.effective_user.id,
+        message_id=query.message.message_id,
+        url=url,
+        mode=mode,
+        title=title,
+        action=execute_download_job,
+        extra={
+            "author": author,
+            "platform": platform,
+            "duration": duration,
+            "direct_url": media_data.get("direct_url"),
+            "mode_label": mode_label,
+            "width": media_data.get("width"),
+            "height": media_data.get("height"),
+            "context": context,
+            "message": query.message,
+            "was_queued": is_busy,
+        }
     )
 
-    temp_dir = tempfile.mkdtemp(prefix="dl_")
-    loop = asyncio.get_running_loop()
+    await queue_manager.enqueue(job)
 
-    try:
-        direct_url = media_data.get("direct_url")
-        file_paths, err = await loop.run_in_executor(None, download_media_sync, url, mode, temp_dir, direct_url)
 
-        if err or not file_paths:
-            logger.error(f"Download failed for {url}: {err}")
-            await query.edit_message_text(
-                f"❌ **Download failed:** `{str(err)[:120]}`\n\n"
-                "Try choosing **Audio (MP3)** or another resolution.",
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
-            return
+async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """CallbackQueryHandler for inline [❌ Cancel] button."""
+    query = update.callback_query
+    await query.answer("Cancelling download...")
 
-        chat_id = query.message.chat_id
-        total_files = len(file_paths)
+    data = query.data
+    if not data or not data.startswith("cancel:"):
+        return
 
-        for idx, file_path in enumerate(file_paths):
-            file_size = os.path.getsize(file_path)
-            file_size_mb = file_size / (1024 * 1024)
-
-            # Check 2GB hard ceiling
-            if file_size > MAX_TELEGRAM_BYTES:
-                await query.edit_message_text(
-                    f"⚠️ **File exceeds 2,000 MB ({file_size_mb:.1f} MB)!**\n\n"
-                    "Telegram has a 2 GB absolute maximum file limit.\n"
-                    "💡 Try selecting **Audio (MP3)** or a lower resolution.",
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-                return
-
-            prefix = f"[{idx + 1}/{total_files}] " if total_files > 1 else ""
-            caption = (
-                f"🎬 <b>{prefix}{html.escape(title[:65])}</b>\n"
-                f"👤 {html.escape(author[:40])} • {platform}\n"
-                f"🤖 Downloaded with @Download_agent01_bot"
-            )
-
-            # 🚀 HIGH-SPEED TELETHON MTPROTO ENGINE (for ALL uploads when connected)
-            if telethon_client and telethon_client.is_connected():
-                await query.edit_message_text(
-                    f"🚀 **Uploading {prefix}({file_size_mb:.1f} MB)...**\n"
-                    "⚡ High-Speed MTProto Engine active\n\n"
-                    "⏳ Initializing upload stream...",
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-
-                upload_stats = {"current": 0, "total": file_size}
-                upload_done = asyncio.Event()
-
-                def sync_progress(cur, tot):
-                    upload_stats["current"] = cur
-                    upload_stats["total"] = tot
-
-                async def progress_notifier():
-                    while not upload_done.is_set():
-                        await asyncio.sleep(2.5)
-                        if upload_done.is_set():
-                            break
-                        cur = upload_stats["current"]
-                        tot = upload_stats["total"]
-                        pct = int((cur / tot) * 100) if tot else 0
-                        cur_mb = cur / (1024 * 1024)
-                        tot_mb = tot / (1024 * 1024)
-                        bar = '█' * (pct // 10) + '░' * (10 - pct // 10)
-                        try:
-                            await query.edit_message_text(
-                                f"📤 **Uploading {prefix}to Telegram ({pct}%)**\n"
-                                f"`[{bar}]` ({cur_mb:.1f} / {tot_mb:.1f} MB)",
-                                parse_mode=constants.ParseMode.MARKDOWN
-                            )
-                        except Exception:
-                            pass
-
-                notifier_task = asyncio.create_task(progress_notifier())
-
-                try:
-                    # Turbo upload: 512KB chunks with 8 concurrent upload pipes
-                    input_file = await fast_upload_file(
-                        telethon_client,
-                        file_path,
-                        progress_callback=sync_progress,
-                        concurrency=8
-                    )
-                finally:
-                    upload_done.set()
-                    notifier_task.cancel()
-
-                if mode == "audio" or file_path.endswith(".mp3"):
-                    attributes = [DocumentAttributeAudio(duration=int(duration or 0), title=title[:60], performer=author[:40])]
-                    await telethon_client.send_file(
-                        chat_id,
-                        input_file,
-                        caption=caption,
-                        parse_mode="html",
-                        attributes=attributes,
-                    )
-                else:
-                    vid_w = media_data.get("width")
-                    vid_h = media_data.get("height")
-                    if mode.isdigit():
-                        target_h = int(mode)
-                        if vid_h and vid_w:
-                            vid_w = int(target_h * (vid_w / vid_h))
-                            vid_h = target_h
-                        else:
-                            vid_h = target_h
-                            vid_w = int(target_h * 16 / 9)
-                    vid_w = int(vid_w or 1280)
-                    vid_h = int(vid_h or 720)
-
-                    attributes = [
-                        DocumentAttributeVideo(
-                            duration=int(duration or 0),
-                            w=vid_w,
-                            h=vid_h,
-                            supports_streaming=True
-                        )
-                    ]
-                    await telethon_client.send_file(
-                        chat_id,
-                        input_file,
-                        caption=caption,
-                        parse_mode="html",
-                        supports_streaming=True,
-                        attributes=attributes,
-                    )
-            else:
-                # 📦 FALLBACK: STANDARD BOT API (for files <= 50MB if Telethon is offline)
-                if file_size > 50 * 1024 * 1024:
-                    await query.edit_message_text(
-                        f"❌ **File is {file_size_mb:.1f} MB.**\n"
-                        "Telethon MTProto engine is offline, and standard Bot API is capped at 50 MB.",
-                        parse_mode=constants.ParseMode.MARKDOWN
-                    )
-                    return
-
-                await query.edit_message_text(
-                    f"📤 **Uploading {prefix}to Telegram ({file_size_mb:.1f} MB)...**",
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-
-                if mode == "audio" or file_path.endswith(".mp3"):
-                    with open(file_path, "rb") as f:
-                        await context.bot.send_audio(
-                            chat_id=chat_id,
-                            audio=f,
-                            title=f"{prefix}{title[:55]}",
-                            performer=author[:40],
-                            caption=caption,
-                            parse_mode=constants.ParseMode.HTML,
-                            read_timeout=300,
-                            write_timeout=300
-                        )
-                else:
-                    with open(file_path, "rb") as f:
-                        await context.bot.send_video(
-                            chat_id=chat_id,
-                            video=f,
-                            caption=caption,
-                            supports_streaming=True,
-                            parse_mode=constants.ParseMode.HTML,
-                            read_timeout=300,
-                            write_timeout=300
-                        )
-
-        try:
-            await query.delete_message()
-        except Exception:
-            pass
-
-    except Exception as e:
-        logger.error(f"Error processing callback: {e}", exc_info=True)
-        await query.edit_message_text(
-            f"❌ **Error sending file:** `{str(e)[:120]}`",
-            parse_mode=constants.ParseMode.MARKDOWN
+    job_id = data.split(":", 1)[1]
+    cancelled = await queue_manager.cancel_job(job_id)
+    if cancelled:
+        await safe_edit_message(
+            query.message,
+            "🚫 **Download cancelled.**",
+            parse_mode=constants.ParseMode.MARKDOWN,
         )
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    else:
+        await safe_edit_message(
+            query.message,
+            "ℹ️ Job was already completed or not found.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """CommandHandler for /cancel: cancels any active or queued job for the user."""
+    user_id = update.effective_user.id
+    cancelled_ids = await queue_manager.cancel_user_jobs(user_id)
+    if cancelled_ids:
+        await update.message.reply_text(
+            f"🚫 **Cancelled {len(cancelled_ids)} download task(s).**",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ You have no active or queued downloads to cancel.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -786,8 +981,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application: Application):
-    """Start Telethon MTProto client inside the same asyncio event loop."""
+    """Start Telethon MTProto client and Download Queue Worker inside the same asyncio event loop."""
     global telethon_client
+    queue_manager.start_worker()
     if API_ID and API_HASH:
         logger.info("🚀 Initializing Telethon MTProto engine for 2GB file uploads...")
         try:
@@ -804,8 +1000,9 @@ async def post_init(application: Application):
 
 
 async def post_shutdown(application: Application):
-    """Gracefully disconnect Telethon."""
+    """Gracefully disconnect Telethon and stop queue worker."""
     global telethon_client
+    await queue_manager.stop_worker()
     if telethon_client and telethon_client.is_connected():
         await telethon_client.disconnect()
         logger.info("Telethon MTProto engine cleanly disconnected.")
@@ -841,7 +1038,9 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("cookies", cookies_command))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CallbackQueryHandler(handle_cancel_callback, pattern=r"^cancel:"))
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^dl:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
